@@ -1,0 +1,25 @@
+Visualization Manager:
+  Class: ""
+  Displays:
+
+    - Name: Map
+      Class: rviz_default_plugins/Map
+      Topic: /map
+      Alpha: 0.7
+
+    - Name: LaserScan
+      Class: rviz_default_plugins/LaserScan
+      Topic: /scan
+      Size (m): 0.05
+      Color: 255; 0; 0
+
+    - Name: TF
+      Class: rviz_default_plugins/TF
+
+    - Name: Odometry
+      Class: rviz_default_plugins/Odometry
+      Topic: /odom
+      Shape: Arrow
+
+  Global Options:
+    Fixed Frame: map

@@ -1,0 +1,32 @@
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+
+```
+<RecoveryNode number_of_retries="3" name="NavigateRecovery">
+
+  <PipelineSequence name="NavigateWithReplanning">
+
+    <RateController hz="3.0">
+      <ComputePathToPose 
+        goal="{goal}" 
+        path="{path}" 
+        planner_id="GridBased"/>
+    </RateController>
+
+    <FollowPath 
+      path="{path}" 
+      controller_id="FollowPath"
+      goal_checker_id="goal_checker"/>
+
+  </PipelineSequence>
+
+  <Sequence name="RecoveryActions">
+    <BackUp backup_dist="0.25" backup_speed="0.1"/>
+    <Wait wait_duration="2.0"/>
+  </Sequence>
+
+</RecoveryNode>
+```
+
+  </BehaviorTree>
+</root>

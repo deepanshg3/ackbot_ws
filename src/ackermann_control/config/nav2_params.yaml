@@ -1,0 +1,255 @@
+amcl:
+  ros__parameters:
+    use_sim_time: false
+
+    scan_topic: /ouster/scan
+
+    min_particles: 500
+    max_particles: 2000
+
+    update_min_d: 0.1
+    update_min_a: 0.1
+
+    resample_interval: 1
+    laser_model_type: likelihood_field
+
+    odom_frame_id: odom
+    base_frame_id: base_link
+    global_frame_id: map
+
+bt_navigator:
+  ros__parameters:
+    use_sim_time: false
+
+    global_frame: map
+    robot_base_frame: base_link
+    odom_topic: /odom
+
+    # ✅ BT Overrides are now securely handled in the launch file.
+
+controller_server:
+  ros__parameters:
+
+    use_sim_time: false
+    controller_frequency: 20.0
+
+    min_x_velocity_threshold: 0.01
+    min_theta_velocity_threshold: 0.001
+
+    progress_checker_plugin: "progress_checker"
+    goal_checker_plugins: ["goal_checker"]
+
+    controller_plugins: ["FollowPath"]
+
+    progress_checker:
+      plugin: "nav2_controller::SimpleProgressChecker"
+      required_movement_radius: 0.05
+      movement_time_allowance: 30.0   # ✅ INCREASED to 30s to allow maneuvering
+
+    goal_checker:
+      plugin: "nav2_controller::SimpleGoalChecker"
+      xy_goal_tolerance: 0.15         # ✅ INCREASED to 35cm
+      yaw_goal_tolerance: 0.25         # ✅ INCREASED to ~28 degrees
+      stateful: true
+
+    FollowPath:
+      plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
+      use_rotate_to_heading: false
+      allow_reversing: true         # ✅ THE MAGIC FIX: Allows Ackermann K-turns
+      desired_linear_vel: 0.20      # ✅ MATCHED to your Arduino/Python max speed
+      
+      max_linear_accel: 1.0
+      max_linear_decel: -1.0
+
+      lookahead_dist: 0.45
+      min_lookahead_dist: 0.3
+      max_lookahead_dist: 0.7
+      lookahead_time: 1.5           
+
+      transform_tolerance: 2.0
+
+      use_velocity_scaled_lookahead_dist: true
+
+      use_regulated_linear_velocity_scaling: true
+      regulated_linear_scaling_min_radius: 0.5    # ✅ Matched to Smac turning radius
+      regulated_linear_scaling_min_speed: 0.10    # ✅ INCREASED to beat your 0.05 Odometry deadband!
+
+      use_collision_detection: true
+
+
+planner_server:
+  ros__parameters:
+
+    expected_planner_frequency: 5.0
+
+    planner_plugins: ["GridBased"]
+
+    GridBased:
+
+      plugin: "nav2_smac_planner/SmacPlannerHybrid"
+
+      tolerance: 0.5
+
+      motion_model_for_search: REEDS_SHEPP
+
+      minimum_turning_radius: 0.5    # ✅ DECREASED from 0.53 to give math breathing room
+
+      allow_unknown: true
+      
+      allow_reverse: true             # ✅ EXPLICITLY ADDED to ensure reversing is permitted
+
+      reverse_penalty: 1.0
+      change_penalty: 0.0
+      non_straight_penalty: 1.2
+      cost_penalty: 5.0
+
+      analytic_expansion_ratio: 3.5
+      analytic_expansion_max_length: 3.0
+
+      angle_quantization_bins: 72
+
+      smooth_path: true
+
+
+behavior_server:
+  ros__parameters:
+
+    use_sim_time: false
+
+    costmap_topic: local_costmap/costmap_raw
+    footprint_topic: local_costmap/published_footprint
+
+    cycle_frequency: 10.0
+
+    behavior_plugins:
+      - "backup"
+      - "drive_on_heading"
+      - "wait"
+
+    backup:
+      plugin: "nav2_behaviors/BackUp"
+
+    drive_on_heading:
+      plugin: "nav2_behaviors/DriveOnHeading"
+
+    wait:
+      plugin: "nav2_behaviors/Wait"
+
+
+velocity_smoother:
+  ros__parameters:
+
+    use_sim_time: false
+
+    smoothing_frequency: 20.0
+
+    scale_velocities: false
+
+    max_velocity: [0.25, 0.0, 0.5]
+    min_velocity: [-0.25, 0.0, -0.5]
+
+    max_accel: [1.0, 0.0, 1.0]
+    max_decel: [-1.0, 0.0, -1.0]
+
+    odom_topic: /odom
+    odom_duration: 0.1
+
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      use_sim_time: false
+      global_frame: odom
+      robot_base_frame: base_link
+      update_frequency: 10.0
+      publish_frequency: 5.0
+      transform_tolerance: 2.0
+      rolling_window: true
+      
+      # ✅ CHANGE 1: Increase to 10m so the 3.67m obstacle isn't cropped out
+      width: 10
+      height: 10
+      
+      resolution: 0.05
+      footprint: "[[0.24, 0.11], [0.24, -0.11], [-0.04, -0.11], [-0.04, 0.11]]"
+
+      # ✅ CHANGE 2: Add QoS Override so it can talk to the Ouster
+      qos_overrides:
+        /ouster/scan:
+          subscription:
+            reliability: best_effort
+
+      plugins: ["obstacle_layer", "inflation_layer"]
+
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: true
+        observation_sources: ouster_scan
+        ouster_scan:
+          topic: /ouster/scan
+          data_type: LaserScan
+          clearing: true
+          marking: true
+          
+          min_obstacle_height: -2.0
+          max_obstacle_height: 2.0
+          
+          obstacle_max_range: 20.0     
+          raytrace_max_range: 25.0     
+
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        enabled: true
+        inflation_radius: 0.3
+        cost_scaling_factor: 4.0
+
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      use_sim_time: false
+      global_frame: map
+      robot_base_frame: base_link
+      update_frequency: 5.0
+      publish_frequency: 2.0
+      transform_tolerance: 2.0
+      
+      # ✅ ADD QoS Override here too for the global obstacle layer
+      qos_overrides:
+        /ouster/scan:
+          subscription:
+            reliability: best_effort
+
+      resolution: 0.05
+      footprint: "[[0.24, 0.11], [0.24, -0.11], [-0.04, -0.11], [-0.04, 0.11]]"
+      # ... rest of your global_costmap remains the same
+
+      # ✅ FIXED: ROS 2 Humble string array syntax
+      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
+
+      # ✅ FIXED: Plugin defined within namespace
+      static_layer:
+        plugin: "nav2_costmap_2d::StaticLayer"
+        enabled: true
+        map_subscribe_transient_local: true
+
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: true
+        observation_sources: ouster_scan
+        ouster_scan:
+          topic: /ouster/scan
+          data_type: LaserScan
+          clearing: true
+          marking: true
+          
+          min_obstacle_height: -2.0
+          max_obstacle_height: 2.0
+          
+          obstacle_max_range: 20.0     
+          raytrace_max_range: 25.0     
+          # sensor_frame removed here as well
+
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        enabled: true
+        inflation_radius: 0.3
+        cost_scaling_factor: 4.0
