@@ -1,0 +1,337 @@
+#include <Servo.h>
+
+// ================= MOTOR PINS =================
+#define L_PWM   5
+#define L_DIR   12
+#define R_PWM   6
+#define R_DIR   4
+
+// ================= ENCODER PINS =================
+#define L_ENC_A 3
+#define L_ENC_B 7
+#define R_ENC_A 2
+#define R_ENC_B 8
+
+// ================= SERVO =================
+#define SERVO_PIN 9
+
+// ================= SERIAL =================
+#define CMD_HEADER1 0xAA
+#define CMD_HEADER2 0x55
+#define CMD_PACKET_LEN 7
+
+// FIXED: Changed payload length back to 10 to match Jetson expectations
+#define ODOM_HEADER1 0x55
+#define ODOM_HEADER2 0xAA
+#define ODOM_PAYLOAD_LEN 10 
+
+// ================= SAFETY =================
+unsigned long lastCommandTime = 0;
+const unsigned long timeout = 500;
+
+// ================= ENCODERS =================
+volatile long leftTicks  = 0;
+volatile long rightTicks = 0;
+
+long lastLeftTicks  = 0;
+long lastRightTicks = 0;
+
+// ================= ROBOT CONSTANTS =================
+const float wheel_diameter = 0.065;
+const float wheel_circumference = 3.1416 * wheel_diameter;
+const float ticks_per_rev = 330.0;
+
+// ================= PID PARAMETERS =================
+float Kp = 45.0;
+float Ki = 12.0;
+float Kd = 0.0;
+
+float targetVelocity = 0.0;
+float measuredVelocity = 0.0;
+
+float integral = 0;
+float lastError = 0;
+
+unsigned long lastPID = 0;
+const float dt = 0.02; // 50 Hz
+
+// ================= MOTOR STATE =================
+int motorDirection = 1;
+int pwmOutput = 0;
+
+// ================= SERVO =================
+Servo steeringServo;
+const int SERVO_CENTER = 1300;
+// FIXED: Restored variable to track servo position for the Jetson
+uint16_t current_servo = SERVO_CENTER; 
+
+// ==================================================
+// ================= ENCODER ISRs ===================
+// ==================================================
+
+void rightEncoderISR() {
+  if (digitalRead(R_ENC_B))
+    rightTicks++;
+  else
+    rightTicks--;
+}
+
+void leftEncoderISR() {
+  if (digitalRead(L_ENC_B))
+    leftTicks--;
+  else
+    leftTicks++;
+}
+
+// ==================================================
+
+void setup() {
+
+  pinMode(L_PWM, OUTPUT);
+  pinMode(L_DIR, OUTPUT);
+  pinMode(R_PWM, OUTPUT);
+  pinMode(R_DIR, OUTPUT);
+
+  pinMode(L_ENC_A, INPUT_PULLUP);
+  pinMode(L_ENC_B, INPUT_PULLUP);
+  pinMode(R_ENC_A, INPUT_PULLUP);
+  pinMode(R_ENC_B, INPUT_PULLUP);
+
+  steeringServo.attach(SERVO_PIN);
+  steeringServo.writeMicroseconds(SERVO_CENTER);
+
+  Serial.begin(115200);
+
+  attachInterrupt(digitalPinToInterrupt(L_ENC_A),
+                  leftEncoderISR, RISING);
+  attachInterrupt(digitalPinToInterrupt(R_ENC_A),
+                  rightEncoderISR, RISING);
+
+  stopMotors();
+}
+
+// ==================================================
+
+void loop() {
+
+  readCommandPacket();
+
+  if (millis() - lastCommandTime > timeout) {
+    stopMotors();
+    targetVelocity = 0;
+  }
+
+  runPID();
+
+  sendEncoderDelta();
+}
+
+// ==================================================
+// ================= COMMAND RX =====================
+// ==================================================
+
+void readCommandPacket() {
+
+  static uint8_t buffer[CMD_PACKET_LEN];
+  static uint8_t index = 0;
+
+  while (Serial.available()) {
+
+    uint8_t b = Serial.read();
+
+    if (index == 0 && b != CMD_HEADER1) continue;
+    if (index == 1 && b != CMD_HEADER2) {
+      index = 0;
+      continue;
+    }
+
+    buffer[index++] = b;
+
+    if (index == CMD_PACKET_LEN) {
+      processCommand(buffer);
+      index = 0;
+    }
+  }
+}
+
+void processCommand(uint8_t *packet) {
+
+  if (packet[2] != 3) return;
+
+  int8_t speed = (int8_t)packet[3];
+
+  uint16_t servo_pwm = packet[4] | (packet[5] << 8);
+  
+  // FIXED: Store the incoming servo position so we can send it back to the Jetson
+  current_servo = servo_pwm; 
+
+  uint8_t checksum =
+    (speed & 0xFF) ^
+    (servo_pwm & 0xFF) ^
+    ((servo_pwm >> 8) & 0xFF);
+
+  if (checksum != packet[6]) return;
+
+  // Convert command to velocity target
+  motorDirection = (speed >= 0) ? 1 : -1;
+
+  // REDUCED SPEED LIMIT: Lowered from 0.34 to 0.20 m/s for safe indoor tuning
+  float maxVel = 0.20; 
+  
+  // MATH FIX: int8_t maximum is 127, so we divide by 127.0 for proper scaling
+  targetVelocity = (abs(speed) / 127.0) * maxVel;
+
+  applySteering(servo_pwm);
+
+  lastCommandTime = millis();
+}
+
+// ==================================================
+// ================= PID CONTROLLER =================
+// ==================================================
+
+void runPID() {
+
+  if (millis() - lastPID < 20) return;
+  lastPID = millis();
+
+  long l;
+
+  noInterrupts();
+  l = leftTicks;
+  interrupts();
+
+  long dL = l - lastLeftTicks;
+  lastLeftTicks = l;
+
+  // =========================================================
+  // THE FIX: HARD STOP OVERRIDE
+  // If target is 0, instantly kill power and erase PID memory
+  // =========================================================
+  if (targetVelocity == 0.0) {
+    integral = 0;
+    pwmOutput = 0;
+    lastError = 0;
+    stopMotors();
+    return; // Exit the function before it does any more math
+  }
+  // =========================================================
+
+  // Cast to float to prevent integer division truncation
+  float rev = (float)dL / ticks_per_rev;
+
+  // REVERSE BUG FIX: Force the measured velocity to always be positive
+  measuredVelocity = abs((rev * wheel_circumference) / dt);
+
+  float error = targetVelocity - measuredVelocity;
+
+  integral += error * dt;
+
+  float derivative = (error - lastError) / dt;
+
+  float output =
+      Kp * error +
+      Ki * integral +
+      Kd * derivative;
+
+  pwmOutput += output;
+
+  // VOLTAGE CAP: Constrained to 160 (out of 255) to prevent violent jerks
+  pwmOutput = constrain(pwmOutput, 0, 160); 
+
+  lastError = error;
+
+  applyMotors(pwmOutput * motorDirection);
+}
+
+// ==================================================
+// ================= MOTOR CONTROL ==================
+// ==================================================
+
+void applyMotors(int pwm) {
+
+  uint8_t power = constrain(abs(pwm), 0, 255);
+
+  if (pwm >= 0) {
+    digitalWrite(L_DIR, HIGH);
+    digitalWrite(R_DIR, LOW);
+  } else {
+    digitalWrite(L_DIR, LOW);
+    digitalWrite(R_DIR, HIGH);
+  }
+
+  analogWrite(L_PWM, power);
+  analogWrite(R_PWM, power);
+}
+
+void stopMotors() {
+
+  analogWrite(L_PWM, 0);
+  analogWrite(R_PWM, 0);
+}
+
+// ==================================================
+// ================= STEERING =======================
+// ==================================================
+
+void applySteering(uint16_t pwm) {
+
+  pwm = constrain(pwm, 650, 1790);
+  steeringServo.writeMicroseconds(pwm);
+}
+
+// ==================================================
+// ================= ENCODER TX =====================
+// ==================================================
+
+void sendEncoderDelta() {
+
+  static unsigned long lastSend = 0;
+  if (millis() - lastSend < 50) return;
+  lastSend = millis();
+
+  static long prevLeft = 0;
+  static long prevRight = 0;
+
+  long l, r;
+
+  noInterrupts();
+  l = leftTicks;
+  r = rightTicks;
+  interrupts();
+
+  int32_t dL = l - prevLeft;
+  int32_t dR = r - prevRight;
+
+  prevLeft = l;
+  prevRight = r;
+
+  uint8_t checksum = 0;
+
+  Serial.write(ODOM_HEADER1);
+  Serial.write(ODOM_HEADER2);
+  Serial.write(ODOM_PAYLOAD_LEN);
+
+  uint8_t *p;
+
+  p = (uint8_t*)&dL;
+  for (int i = 0; i < 4; i++) {
+    Serial.write(p[i]);
+    checksum ^= p[i];
+  }
+
+  p = (uint8_t*)&dR;
+  for (int i = 0; i < 4; i++) {
+    Serial.write(p[i]);
+    checksum ^= p[i];
+  }
+
+  // FIXED: Restored the servo transmission block so it sends all 10 bytes
+  p = (uint8_t*)&current_servo;
+  for (int i = 0; i < 2; i++) {
+    Serial.write(p[i]);
+    checksum ^= p[i];
+  }
+
+  Serial.write(checksum);
+}
